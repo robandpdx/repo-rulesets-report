@@ -30,6 +30,14 @@ def http_error(code, headers=None, message=""):
     )
 
 
+def fetch_org_suites(org, token, time_period="month", evaluate_status="active"):
+    return list(report.GitHubClient(token).paginate(
+        f"/orgs/{org}/rulesets/rule-suites",
+        {"rule_suite_result": "bypass", "time_period": time_period,
+         "evaluate_status": evaluate_status},
+    ))
+
+
 class FetchTests(unittest.TestCase):
     @patch.object(report, "build_opener")
     def test_pagination_and_filters(self, build_opener):
@@ -38,7 +46,7 @@ class FetchTests(unittest.TestCase):
             response([{"id": i} for i in range(100)]),
             response([{"id": 100, "additional": {"enabled": True}}]),
         ]
-        suites = report.fetch_suites("example-org", "fake-token")
+        suites = fetch_org_suites("example-org", "fake-token")
         self.assertEqual(len(suites), 101)
         self.assertEqual(suites[-1]["additional"], {"enabled": True})
         for page, call in enumerate(opener.open.call_args_list, 1):
@@ -62,7 +70,7 @@ class FetchTests(unittest.TestCase):
             response([{"id": 1}], '<https://api.github.com/example?page=2>; rel="next"'),
             response([{"id": 2}]),
         ]
-        self.assertEqual(report.fetch_suites("example", "fake-token"),
+        self.assertEqual(fetch_org_suites("example", "fake-token"),
                          [{"id": 1}, {"id": 2}])
 
     @patch.object(report, "build_opener")
@@ -70,7 +78,18 @@ class FetchTests(unittest.TestCase):
         build_opener.return_value.open.side_effect = [
             response([{"id": i} for i in range(100)]), response([]),
         ]
-        self.assertEqual(len(report.fetch_suites("example", "fake-token")), 100)
+        self.assertEqual(len(fetch_org_suites("example", "fake-token")), 100)
+
+    @patch.object(report, "build_opener")
+    def test_full_final_page_with_link_does_not_make_an_extra_call(self, build_opener):
+        opener = build_opener.return_value
+        opener.open.side_effect = [
+            response([{"id": 0}], '<https://api.github.com/example?page=2>; rel="next"'),
+            response([{"id": i} for i in range(1, 101)],
+                     '<https://api.github.com/example?page=1>; rel="prev"'),
+        ]
+        self.assertEqual(len(fetch_org_suites("example", "fake-token")), 101)
+        self.assertEqual(opener.open.call_count, 2)
 
     @patch.object(report, "build_opener")
     def test_http_error_on_later_page_is_not_partial_success(self, build_opener):
@@ -79,7 +98,7 @@ class FetchTests(unittest.TestCase):
             http_error(403, message="Resource not accessible"),
         ]
         with self.assertRaisesRegex(report.ReportError, "HTTP 403 on page 2"):
-            report.fetch_suites("example", "fake-token")
+            fetch_org_suites("example", "fake-token")
 
     @patch.object(report, "build_opener")
     def test_network_and_invalid_response_errors(self, build_opener):
@@ -88,20 +107,20 @@ class FetchTests(unittest.TestCase):
             with self.subTest(error=type(error)):
                 opener.open.side_effect = error
                 with self.assertRaisesRegex(report.ReportError, "Network request"):
-                    report.fetch_suites("example", "fake-token")
+                    fetch_org_suites("example", "fake-token")
         opener.open.side_effect = None
         for payload in ({"message": "error"}, [1], [None], [True]):
             with self.subTest(payload=payload):
                 opener.open.return_value = response(payload)
                 with self.assertRaisesRegex(report.ReportError, "array of objects"):
-                    report.fetch_suites("example", "fake-token")
+                    fetch_org_suites("example", "fake-token")
         for raw in (b"not json", b"\xff", b'[{"id": NaN}]'):
             with self.subTest(raw=raw):
                 invalid = response([])
                 invalid.read.return_value = raw
                 opener.open.return_value = invalid
                 with self.assertRaisesRegex(report.ReportError, "Invalid JSON"):
-                    report.fetch_suites("example", "fake-token")
+                    fetch_org_suites("example", "fake-token")
 
     @patch.object(report, "build_opener")
     def test_invalid_pagination(self, build_opener):
@@ -112,12 +131,121 @@ class FetchTests(unittest.TestCase):
             with self.subTest(result=result):
                 build_opener.return_value.open.return_value = result
                 with self.assertRaisesRegex(report.ReportError, "Invalid"):
-                    report.fetch_suites("example", "fake-token")
+                    fetch_org_suites("example", "fake-token")
 
     def test_redirects_are_disabled(self):
         self.assertIsNone(report.NoRedirects().redirect_request(
             None, None, 302, "", {}, "https://example.com"
         ))
+
+
+@patch.object(report, "build_opener")
+class CollectionTests(unittest.TestCase):
+    def test_combines_scopes_deduplicates_and_preserves_fields(self, build):
+        org_only = {"id": 1, "repository_id": 10, "repository_name": "first"}
+        shared = {"id": 2, "repository_id": 10, "org_extra": "retained"}
+        repo_only = {"id": 3, "repository_id": 10, "repo_extra": {"key": True}}
+        other_repo = {"id": 1, "repository_id": 20}
+        opener = build.return_value
+        opener.open.side_effect = [
+            response([org_only, shared]),
+            response([{"name": "first", "archived": True}, {"name": "FIRST"},
+                      {"name": "second", "fork": True}]),
+            response([{"id": 2, "repository_id": 10, "repo_extra": "added"},
+                      repo_only, repo_only]),
+            response([other_repo]),
+        ]
+        suites = report.fetch_suites("example", "fake-token", "week", "all")
+        self.assertEqual(suites, [
+            org_only, {**shared, "repo_extra": "added"}, repo_only, other_repo,
+        ])
+        self.assertEqual(build.call_count, 1)
+        paths = []
+        for call in opener.open.call_args_list:
+            request = call.args[0]
+            url = urlsplit(request.full_url)
+            self.assertEqual(url.netloc, "api.github.com")
+            paths.append(url.path)
+            query = parse_qs(url.query)
+            if url.path.endswith("rule-suites"):
+                self.assertEqual(query, {
+                    "rule_suite_result": ["bypass"], "time_period": ["week"],
+                    "evaluate_status": ["all"], "per_page": ["100"], "page": ["1"],
+                })
+            else:
+                self.assertEqual(query, {
+                    "type": ["all"], "sort": ["full_name"], "direction": ["asc"],
+                    "per_page": ["100"], "page": ["1"],
+                })
+        self.assertEqual(paths, [
+            "/orgs/example/rulesets/rule-suites", "/orgs/example/repos",
+            "/repos/example/first/rulesets/rule-suites",
+            "/repos/example/second/rulesets/rule-suites",
+        ])
+
+    def test_repository_discovery_and_suite_pagination(self, build):
+        opener = build.return_value
+        opener.open.side_effect = [
+            response([]),
+            response([{"name": "first"}],
+                     '<https://api.github.com/orgs/example/repos?page=2>; rel="next"'),
+            response([{"name": "second"}]),
+            response([{"id": i, "repository_id": 10} for i in range(100)],
+                     '<https://untrusted.example/?page=2>; rel="next"'),
+            response([{"id": 100, "repository_id": 10}]),
+            response([{"id": 200, "repository_id": 20}]),
+        ]
+        suites = report.fetch_suites("example", "fake-token")
+        self.assertEqual(len(suites), 102)
+        urls = [urlsplit(call.args[0].full_url) for call in opener.open.call_args_list]
+        self.assertEqual([parse_qs(url.query)["page"][0] for url in urls],
+                         ["1", "1", "2", "1", "2", "1"])
+        self.assertTrue(all(url.netloc == "api.github.com" for url in urls))
+        self.assertEqual(urls[3].path, urls[4].path)
+
+    def test_empty_organization(self, build):
+        build.return_value.open.side_effect = [response([]), response([])]
+        self.assertEqual(report.fetch_suites("example", "fake-token"), [])
+        self.assertEqual(build.return_value.open.call_count, 2)
+
+    @patch.object(report.time, "sleep")
+    def test_rate_limits_during_discovery_and_repository_collection(self, sleep, build):
+        opener = build.return_value
+        opener.open.side_effect = [
+            response([]),
+            http_error(429, {"Retry-After": "1"}),
+            response([{"name": "first"}]),
+            response([{"id": 1, "repository_id": 10}],
+                     '<https://api.github.com/example?page=2>; rel="next"'),
+            http_error(403, message="secondary rate limit"),
+            response([{"id": 2, "repository_id": 10}]),
+        ]
+        with patch("sys.stderr", new=io.StringIO()):
+            suites = report.fetch_suites("example", "fake-token")
+        self.assertEqual([suite["id"] for suite in suites], [1, 2])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 60])
+        calls = opener.open.call_args_list
+        self.assertEqual(calls[1].args[0].full_url, calls[2].args[0].full_url)
+        self.assertEqual(calls[4].args[0].full_url, calls[5].args[0].full_url)
+
+    def test_invalid_repository_names_fail_explicitly(self, build):
+        for name in (None, "", "..", ".", "../other", "repo?token=x", ["repo"]):
+            with self.subTest(name=name):
+                build.return_value.open.side_effect = [
+                    response([]), response([{"name": name}]),
+                ]
+                with self.assertRaisesRegex(report.ReportError, "Invalid repository name"):
+                    report.fetch_suites("example", "fake-token")
+
+    def test_invalid_suite_identity_fails_explicitly(self, build):
+        for suite in ({"id": 1}, {"repository_id": 10}, {"id": [], "repository_id": 10},
+                      {"id": True, "repository_id": 10}, {"id": 1, "repository_id": "10"}):
+            with self.subTest(suite=suite):
+                build.return_value.open.side_effect = [
+                    response([]), response([{"name": "first"}]), response([suite]),
+                ]
+                with self.assertRaisesRegex(report.ReportError, "Invalid rule suite"):
+                    report.fetch_suites("example", "fake-token")
 
 
 @patch.object(report.time, "sleep")
@@ -131,7 +259,7 @@ class RateLimitTests(unittest.TestCase):
             response([{"id": 100}]),
         ]
         with patch("sys.stderr", new=io.StringIO()) as stderr:
-            suites = report.fetch_suites("example", "fake-token")
+            suites = fetch_org_suites("example", "fake-token")
         self.assertEqual(len(suites), 101)
         sleep.assert_called_once_with(2)
         self.assertEqual(opener.open.call_args_list[1].args[0].full_url,
@@ -145,7 +273,7 @@ class RateLimitTests(unittest.TestCase):
             response([]),
         ]
         with patch("sys.stderr", new=io.StringIO()):
-            self.assertEqual(report.fetch_suites("example", "fake-token"), [])
+            self.assertEqual(fetch_org_suites("example", "fake-token"), [])
         sleep.assert_called_once_with(6)
 
     @patch.object(report.time, "time", return_value=0)
@@ -155,7 +283,7 @@ class RateLimitTests(unittest.TestCase):
             response([]),
         ]
         with patch("sys.stderr", new=io.StringIO()):
-            report.fetch_suites("example", "fake-token")
+            fetch_org_suites("example", "fake-token")
         sleep.assert_called_once_with(3)
 
     def test_secondary_limit_backoff_and_exhaustion(self, build, sleep):
@@ -165,7 +293,7 @@ class RateLimitTests(unittest.TestCase):
         ]
         with patch("sys.stderr", new=io.StringIO()):
             with self.assertRaisesRegex(report.ReportError, "retries exhausted"):
-                report.fetch_suites("example", "fake-token")
+                fetch_org_suites("example", "fake-token")
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [60, 120, 240])
 
     def test_long_wait_and_invalid_headers_do_not_sleep(self, build, sleep):
@@ -175,7 +303,7 @@ class RateLimitTests(unittest.TestCase):
             with self.subTest(headers=headers):
                 build.return_value.open.side_effect = http_error(429, headers)
                 with self.assertRaisesRegex(report.ReportError, "rate limited|Rate limited"):
-                    report.fetch_suites("example", "fake-token")
+                    fetch_org_suites("example", "fake-token")
         sleep.assert_not_called()
 
     def test_auth_and_permission_errors_do_not_retry(self, build, sleep):
@@ -184,7 +312,7 @@ class RateLimitTests(unittest.TestCase):
                 build.return_value.open.reset_mock()
                 build.return_value.open.side_effect = http_error(code)
                 with self.assertRaisesRegex(report.ReportError, f"HTTP {code}"):
-                    report.fetch_suites("example", "fake-token")
+                    fetch_org_suites("example", "fake-token")
                 build.return_value.open.assert_called_once()
         sleep.assert_not_called()
 
@@ -310,7 +438,7 @@ class CsvAndCliTests(unittest.TestCase):
     def test_rate_limit_failure_after_a_page_preserves_report(self, sleep, build, token):
         self.output.write_text("existing", encoding="utf-8")
         build.return_value.open.side_effect = [
-            response([{"id": i} for i in range(100)]),
+            response([{"id": i, "repository_id": 1} for i in range(100)]),
             *[http_error(429, {"Retry-After": "1"}) for _ in range(4)],
         ]
         with patch("sys.stderr", new=io.StringIO()) as stderr:
@@ -321,6 +449,78 @@ class CsvAndCliTests(unittest.TestCase):
         self.assertEqual(self.output.read_text(encoding="utf-8"), "existing")
         self.assertEqual(list(self.output.parent.iterdir()), [self.output])
         self.assertEqual(sleep.call_count, 3)
+
+    @patch.object(report, "get_token", return_value="fake-token")
+    @patch.object(report, "build_opener")
+    def test_repository_or_discovery_failure_preserves_report(self, build, token):
+        self.output.write_text("existing", encoding="utf-8")
+        suite = {"id": 1, "repository_id": 10}
+        for code in (401, 403, 404, 500):
+            for discovery in (True, False):
+                with self.subTest(code=code, discovery=discovery):
+                    results = [response([suite])]
+                    if not discovery:
+                        results.extend([
+                            response([{"name": "first"}, {"name": "second"}]),
+                            response([{"id": 2, "repository_id": 10}]),
+                        ])
+                    build.return_value.open.side_effect = [*results, http_error(code)]
+                    with patch("sys.stderr", new=io.StringIO()) as stderr, \
+                            patch("sys.stdout", new=io.StringIO()) as stdout:
+                        self.assertEqual(report.main([
+                            "-o", "example", "--output", str(self.output),
+                        ]), 1)
+                    path = ("/orgs/example/repos" if discovery else
+                            "/repos/example/second/rulesets/rule-suites")
+                    self.assertIn(path, stderr.getvalue())
+                    self.assertIn(f"HTTP {code}", stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(self.output.read_text(encoding="utf-8"), "existing")
+                    self.assertEqual(list(self.output.parent.iterdir()), [self.output])
+
+    @patch.object(report, "get_token", return_value="fake-token")
+    @patch.object(report, "build_opener")
+    @patch.object(report.time, "sleep")
+    def test_repository_retry_exhaustion_preserves_report(self, sleep, build, token):
+        self.output.write_text("existing", encoding="utf-8")
+        build.return_value.open.side_effect = [
+            response([]), response([{"name": "first"}, {"name": "second"}]),
+            response([{"id": 1, "repository_id": 10}]),
+            response([{"id": 2, "repository_id": 20}],
+                     '<https://api.github.com/example?page=2>; rel="next"'),
+            *[http_error(429, {"Retry-After": "1"}) for _ in range(4)],
+        ]
+        with patch("sys.stderr", new=io.StringIO()) as stderr, \
+                patch("sys.stdout", new=io.StringIO()) as stdout:
+            self.assertEqual(report.main([
+                "-o", "example", "--output", str(self.output),
+            ]), 1)
+        self.assertIn("/repos/example/second/rulesets/rule-suites", stderr.getvalue())
+        self.assertIn("retries exhausted on page 2", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "existing")
+        self.assertEqual(list(self.output.parent.iterdir()), [self.output])
+        self.assertEqual(sleep.call_count, 3)
+
+    @patch.object(report, "get_token", return_value="fake-token")
+    @patch.object(report, "build_opener")
+    def test_cli_writes_repository_bypasses(self, build, token):
+        build.return_value.open.side_effect = [
+            response([]), response([{"name": "first"}]),
+            response([{"id": 42, "repository_id": 10, "repository_name": "first",
+                       "result": "bypass", "extra": {"source": "repository"}}]),
+        ]
+        with patch("sys.stdout", new=io.StringIO()) as stdout:
+            self.assertEqual(report.main([
+                "-o", "example", "--output", str(self.output),
+            ]), 0)
+        with self.output.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "42")
+        self.assertEqual(rows[0]["repository_name"], "first")
+        self.assertEqual(json.loads(rows[0]["extra"]), {"source": "repository"})
+        self.assertIn("Wrote 1 rule suite(s)", stdout.getvalue())
 
     def test_invalid_cli_arguments(self):
         for args in ([], ["-o", "../example"], ["-o", "example", "--time-period", "year"],

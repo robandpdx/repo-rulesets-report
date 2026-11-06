@@ -14,11 +14,17 @@ exporter.
 
 ## Ruleset bypass activity report
 
-A dependency-free Python CLI that exports **completed organization ruleset
-bypass activity**, one CSV row per rule suite. It calls
+A dependency-free Python CLI that exports **completed bypass activity for both
+organization-level and repository-level rulesets**, one CSV row per rule suite.
+It combines
 [`GET /orgs/{org}/rulesets/rule-suites`](https://docs.github.com/en/rest/orgs/rule-suites#list-organization-rule-suites)
-with `rule_suite_result=bypass`, retrieves all pages, and includes every field
-returned by the list endpoint.
+with
+[`GET /repos/{owner}/{repo}/rulesets/rule-suites`](https://docs.github.com/en/rest/repos/rule-suites#list-repository-rule-suites)
+for every repository returned by
+[`GET /orgs/{org}/repos`](https://docs.github.com/en/rest/repos/repos#list-organization-repositories).
+Both suite endpoints use `rule_suite_result=bypass`. All pages are retrieved,
+overlapping suites are deduplicated by `(repository_id, id)`, and every returned
+suite field is included in the CSV.
 
 This is **not** a push-protection bypass-request report, a list of people eligible
 to bypass rules, or a count of distinct users.
@@ -45,22 +51,26 @@ environment, for example through a secret manager. Lookup order is `GH_TOKEN`,
 passed as CLI options, written to the CSV, or printed by the tool. Do not commit
 tokens or reports. The tool targets GitHub.com, not GitHub Enterprise Server.
 
-For the **activity report**, the [current endpoint documentation](https://docs.github.com/en/rest/orgs/rule-suites#list-organization-rule-suites--fine-grained-access-tokens)
-supports fine-grained personal access tokens, GitHub App user access tokens,
-and GitHub App installation access tokens. It requires **"Administration"
-organization permissions (write)** for fine-grained tokens, despite the endpoint
-being read-only. Configure access for the target organization; organization
-approval may also be required. Do not substitute repository Administration or
-assume read-only organization permission is sufficient.
+For the **activity report**, the endpoints support fine-grained personal access
+tokens, GitHub App user access tokens, and GitHub App installation access tokens.
+For fine-grained tokens:
+
+- The [organization suite endpoint](https://docs.github.com/en/rest/orgs/rule-suites#list-organization-rule-suites--fine-grained-access-tokens)
+  requires **"Administration" organization permissions (write)**, despite being
+  read-only. Repository Administration does not substitute for this permission.
+- The [repository suite endpoint](https://docs.github.com/en/rest/repos/rule-suites#list-repository-rule-suites--fine-grained-access-tokens)
+  requires **"Administration" repository permissions (read)**.
+- Configure access to the target organization and **all repositories** whose
+  activity must be included. Organization approval may also be required.
 
 Existing `gh` credentials must also be authorized to access this endpoint;
 successful login alone does not guarantee access. For classic/OAuth credentials,
 check your organization's policy and SAML SSO authorization rather than assuming
-the default CLI scopes are sufficient. The endpoint reference does not specify a
+the default CLI scopes are sufficient. The organization endpoint reference does not specify a
 classic-token scope, so this tool does not claim a minimum classic scope.
 Never broaden token permissions unnecessarily. A `403` can indicate insufficient
-access or rate limiting; a `404` can indicate an incorrect login or inaccessible
-organization. Requests use API version `2026-03-10`.
+access or rate limiting; a `404` can indicate an incorrect name or inaccessible
+organization/repository. Requests use API version `2026-03-10`.
 
 ## Usage
 
@@ -89,21 +99,47 @@ The endpoint's own default time period is `day`; this tool explicitly requests
 `month`. GitHub defines these rolling lookback windows (`day` is the past 24 hours;
 `week` is the past 168 hours). This tool does not accept arbitrary historical
 start/end dates or promise access beyond the API's available history.
-The list endpoint also supports `actor_name`, `ref`, and `repository_name` filters,
-but this CLI intentionally does not apply them.
+Both suite endpoints also support `actor_name` and `ref` filters; the organization
+endpoint additionally supports `repository_name`. This CLI intentionally does not
+apply these filters. The selected lookback and enforcement filters apply to
+organization and repository queries alike.
 
 The tool requests 100 rows per page and paginates until completion. Only after
-every page succeeds does it write a UTF-8 CSV, replacing the chosen output file
+every organization, discovery, and repository page succeeds does it write a UTF-8 CSV, replacing the chosen output file
 atomically. Existing output is overwritten on success; parent directories must
 already exist. Zero results produce a header-only file, not an error.
 HTTP, authentication, network, malformed-response, and output errors print to
 stderr and exit with status `1`; invalid CLI arguments exit with status `2`.
-Retrieval failures do not create or overwrite a report.
+Retrieval failures do not create or overwrite a report. A repository that returns
+`403` or `404` (including one deleted or transferred during collection) fails the
+report rather than being silently skipped. Errors identify the endpoint and page.
 
-### Pagination and rate limits
+### API efficiency, pagination, and rate limits
+
+The exporter lists repositories once, with `type=all` and a stable name sort,
+then queries each distinct repository once, plus any additional result pages.
+Private repositories, forks, and archived repositories are included when visible
+to the token. It does not fetch ruleset definitions or individual suite details,
+and does not guess whether a repository has relevant activity from its current
+ruleset configuration or last-push timestamp.
+
+Without retries, the request count is:
+
+```text
+organization suite pages + repository listing pages + sum(repository suite pages)
+```
+
+Each endpoint needs at least one request even when empty. Requests are sequential,
+using one shared opener, to avoid bursts of concurrent traffic. Overlapping
+organization/repository results and repeated repository listings do not produce
+duplicate report rows or repeated scans of the same repository. Duplicate suite
+records are merged, retaining fields unique to either response.
 
 The exporter follows pagination by requesting successive page numbers, using
-GitHub's `Link: ...; rel="next"` signal and continuing after full 100-row pages.
+GitHub's `Link: ...; rel="next"` signal. A nonempty `Link` header without `next`
+ends pagination even after a full 100-row page, avoiding a redundant request.
+When no usable `Link` header is returned, a full page triggers another request
+to avoid truncation; a short page ends pagination.
 Rate-limited requests retry **the same page**, without appending duplicate rows.
 It honors `Retry-After` (seconds or an HTTP date) first, then
 `X-RateLimit-Reset` when the remaining quota is zero. Secondary limits without
@@ -114,12 +150,13 @@ There are at most three retries per page and each automatic wait is capped at
 rather than retrying before GitHub permits it. Retry progress goes to stderr;
 exhausted retries fail explicitly and leave any existing report untouched.
 Authentication/permission errors are not retried as rate limits unless GitHub
-identifies rate limiting through its headers or error message. Other HTTP and
-network failures are not retried automatically.
+identifies rate limiting through its headers or error message. These rules apply
+to repository discovery and both suite endpoints. Other HTTP and network failures
+are not retried automatically.
 
 ## Report columns
 
-These are the list endpoint's documented fields. They appear even in empty reports.
+These are both suite list endpoints' documented fields. They appear even in empty reports.
 
 | Column | Meaning |
 | --- | --- |
@@ -136,16 +173,18 @@ These are the list endpoint's documented fields. They appear even in empty repor
 | `evaluation_result` | Rules evaluation outcome returned by GitHub, distinct from the suite result. |
 
 Any additional returned fields are included as extra columns, sorted by name,
-including fields first encountered on later pages. Nested objects and arrays
+including fields first encountered on later pages or repositories. Nested objects and arrays
 are serialized as JSON within correctly quoted CSV cells; booleans are `true`
 or `false`. Null and missing values become empty cells. Other scalar values
 are preserved as CSV text.
 
 The separate
 [`GET /orgs/{org}/rulesets/rule-suites/{rule_suite_id}`](https://docs.github.com/en/rest/orgs/rule-suites#get-an-organization-rule-suite)
-detail endpoint exposes `rule_evaluations`. This tool does **not** request
-details or infer which individual rule was bypassed, the bypass reason, or
-actor eligibility from the list data.
+and
+[`GET /repos/{owner}/{repo}/rulesets/rule-suites/{rule_suite_id}`](https://docs.github.com/en/rest/repos/rule-suites#get-a-repository-rule-suite)
+detail endpoints expose `rule_evaluations`. This tool does **not** request
+details or infer which individual rule was bypassed, where its ruleset was
+configured, the bypass reason, or actor eligibility from the list data.
 
 ### Interpretation and limitations
 
@@ -156,8 +195,14 @@ and lookback window alongside your report. An empty report means no matching
 activity was returned in that scope, not that no one can bypass rules.
 
 Pagination is not an atomic snapshot: concurrent activity may change the results
-while pages are retrieved. Coverage is limited to what the authenticated caller
-and the API expose. CSV cells contain unmodified API values; treat reports as
+while pages are retrieved. Repositories are queried at different times, so their
+rolling lookback windows are not an atomic organization-wide snapshot.
+Coverage is limited to what the authenticated caller and the API expose.
+In particular, repositories omitted from the repository listing because of token
+access restrictions cannot be scanned; a successful run does not prove that the
+token could see every repository in the organization. Deleted repositories that
+are no longer listed cannot be scanned either.
+CSV cells contain unmodified API values; treat reports as
 untrusted data and import cells as text in spreadsheet software to avoid formula
 execution. Reports can contain sensitive organization activity: store and share
 them appropriately. CSV reports are excluded by `.gitignore`.
@@ -278,7 +323,9 @@ python3 -m unittest -v
 ```
 
 Tests use fabricated values and mock authentication/network calls. They cover
-both scripts, repository/ruleset pagination, rate-limit retries and exhaustion,
-all-field CSV output, bypass actor types and modes, hidden actor permissions,
-empty results, failures, authentication, and CLI options. No real organization
-queries are needed.
+both scripts, organization/repository/ruleset pagination, repository discovery,
+cross-endpoint deduplication, request counts, rate-limit retries and exhaustion,
+filters, all-field CSV output, bypass actor types and modes, hidden actor
+permissions, empty results, failures without partial reports, authentication,
+and CLI options.
+No real organization queries are needed.

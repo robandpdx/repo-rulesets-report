@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export completed organization ruleset bypass activity to CSV."""
+"""Export completed organization and repository ruleset bypass activity to CSV."""
 
 import argparse
 import csv
@@ -170,7 +170,7 @@ def fetch_page(opener, request, page):
                 continue
             hints = {
                 401: "Check that your token is valid.",
-                403: "Check organization access, token permissions and SSO authorization.",
+                403: "Check organization/repository access, token permissions and SSO authorization.",
                 404: "Check the requested resource and your access to it.",
             }
             hint = hints.get(exc.code, "Check GitHub API availability and retry.")
@@ -233,21 +233,48 @@ class GitHubClient:
             if not payload and has_next:
                 raise ReportError(f"{path}: Invalid pagination on page {page}: empty next page.")
             yield from payload
-            if len(payload) < 100 and not has_next:
+            if not has_next and (link or len(payload) < 100):
                 return
             page += 1
 
 
 def fetch_suites(org, token, time_period="month", evaluate_status="active"):
     client = GitHubClient(token)
-    return list(client.paginate(
-        f"/orgs/{org}/rulesets/rule-suites",
-        {
-            "rule_suite_result": "bypass",
-            "time_period": time_period,
-            "evaluate_status": evaluate_status,
-        },
+    parameters = {
+        "rule_suite_result": "bypass",
+        "time_period": time_period,
+        "evaluate_status": evaluate_status,
+    }
+    suites = {}
+
+    def collect(path):
+        for suite in client.paginate(path, parameters):
+            if any(type(suite.get(key)) is not int for key in ("repository_id", "id")):
+                raise ReportError(
+                    f"{path}: Invalid rule suite: expected integer repository_id and id."
+                )
+            key = (suite["repository_id"], suite["id"])
+            if key in suites:
+                suites[key].update(suite)
+            else:
+                suites[key] = suite
+
+    collect(f"/orgs/{org}/rulesets/rule-suites")
+    repositories = list(client.paginate(
+        f"/orgs/{org}/repos",
+        {"type": "all", "sort": "full_name", "direction": "asc"},
     ))
+    seen = set()
+    for repository in repositories:
+        name = repository.get("name")
+        if (not isinstance(name, str) or name in (".", "..")
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)):
+            raise ReportError(f"/orgs/{org}/repos: Invalid repository name.")
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        collect(f"/repos/{org}/{name}/rulesets/rule-suites")
+    return list(suites.values())
 
 
 def csv_value(value):
