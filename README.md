@@ -1,4 +1,18 @@
-# Ruleset bypass CSV report
+# Ruleset CSV reports
+
+Two dependency-free Python CLIs for GitHub.com:
+
+| Script | Report |
+| --- | --- |
+| `ruleset_bypass_report.py` | Completed ruleset bypass **activity** within a lookback window. |
+| [`repo_rulesets_report.py`](#repository-rulesets-and-bypass-actors) | Current repository ruleset **configuration** and configured bypass actors. |
+
+Both use `-o`/`--org`, environment or `gh` authentication, complete pagination,
+bounded rate-limit retries, and atomic CSV output. Keep both scripts together:
+the configuration exporter imports the shared API/CSV helpers from the activity
+exporter.
+
+## Ruleset bypass activity report
 
 A dependency-free Python CLI that exports **completed organization ruleset
 bypass activity**, one CSV row per rule suite. It calls
@@ -31,7 +45,7 @@ environment, for example through a secret manager. Lookup order is `GH_TOKEN`,
 passed as CLI options, written to the CSV, or printed by the tool. Do not commit
 tokens or reports. The tool targets GitHub.com, not GitHub Enterprise Server.
 
-The [current endpoint documentation](https://docs.github.com/en/rest/orgs/rule-suites#list-organization-rule-suites--fine-grained-access-tokens)
+For the **activity report**, the [current endpoint documentation](https://docs.github.com/en/rest/orgs/rule-suites#list-organization-rule-suites--fine-grained-access-tokens)
 supports fine-grained personal access tokens, GitHub App user access tokens,
 and GitHub App installation access tokens. It requires **"Administration"
 organization permissions (write)** for fine-grained tokens, despite the endpoint
@@ -148,6 +162,115 @@ untrusted data and import cells as text in spreadsheet software to avoid formula
 execution. Reports can contain sensitive organization activity: store and share
 them appropriately. CSV reports are excluded by `.gitignore`.
 
+## Repository rulesets and bypass actors
+
+`repo_rulesets_report.py` inventories the rulesets returned for **every repository
+visible to the token** in an organization, including repository-level rulesets.
+By default it also includes inherited organization/enterprise rulesets that the
+repository API returns. Source type and source name distinguish local and
+inherited configuration. All returned enforcement states and targets are
+included, including disabled/evaluate-mode rulesets, tags, and push rulesets.
+No target or enforcement filter is applied.
+
+```sh
+# Local rulesets plus any inherited rulesets returned by GitHub.
+python3 repo_rulesets_report.py -o example-org
+
+# Only rulesets configured at the repository level.
+python3 repo_rulesets_report.py --org example-org --repository-only \
+  --output ./example-repository-rulesets.csv
+
+python3 repo_rulesets_report.py --help
+```
+
+Default output: `ORG-repo-rulesets.csv` in the current working directory.
+There is no time-period option: this is current configuration, not activity.
+Archived repositories and forks are included when visible to the caller.
+
+### Access and completeness
+
+Authentication lookup is the same as the activity report. The current REST
+documentation lists **Metadata repository permission (read)** for
+[listing organization repositories](https://docs.github.com/en/rest/repos/repos#list-organization-repositories),
+[listing repository rulesets](https://docs.github.com/en/rest/repos/rules#get-all-repository-rulesets),
+and [reading a repository ruleset](https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset).
+However, GitHub explicitly **omits `bypass_actors` unless the caller has write
+access to that ruleset**. Read access alone is not enough for this report.
+Use credentials with write access to each ruleset being inventoried, including
+the appropriate organization/enterprise access for inherited rulesets. Repository
+Administration (write) is relevant to repository-owned rulesets, not a substitute
+for access to organization-owned rulesets. A token must also have access to every
+repository you intend to cover; a selected-repository token cannot inventory
+repositories outside its selection.
+
+If GitHub hides a bypass list, the script fails explicitly rather than treating
+it as an empty list. API errors, malformed responses, hidden actor lists, or
+failed writes exit `1` without creating/replacing the final report. Invalid CLI
+arguments exit `2`. An empty organization result produces headers only.
+Repositories without rulesets still get a coverage row.
+
+Visibility limitations apply even when requests succeed: the API may silently
+omit repositories the caller cannot see. This report is not proof of
+organization-wide completeness unless the caller has organization-wide access.
+Like the activity report, multiple requests are not an atomic snapshot.
+
+### CSV layout and interpretation
+
+There is **one row per repository/ruleset/bypass-actor combination**. A ruleset
+with no bypass actors gets one row with empty actor columns. A repository with
+no rulesets gets one row with empty ruleset/actor columns. An inherited ruleset
+appears under each repository for which GitHub returns it.
+
+| Columns | Meaning |
+| --- | --- |
+| `organization` | Requested organization login. |
+| `repository_id`, `repository_name`, `repository_full_name` | Repository identity. |
+| `repository_visibility`, `repository_private`, `repository_archived`, `repository_fork`, `repository_html_url` | Repository scope and context, when returned. |
+| `record_type` | `ruleset` or `repository_without_rulesets`. |
+| `bypass_actors_status` | `configured`, `none` (explicit empty array), or `not_applicable` (no rulesets). Hidden actor lists are errors, never `none`. |
+| `bypass_actor_type`, `bypass_actor_id` | Configured actor kind and GitHub ID. IDs are scoped by actor type, not necessarily user IDs. |
+| `bypass_mode` | `always`, `pull_request`, or `exempt`, as returned by GitHub. |
+| `bypass_actor_json` | Complete actor object, including any additional fields. |
+| `ruleset_id`, `ruleset_name`, `ruleset_node_id` | Ruleset identity. |
+| `ruleset_source_type`, `ruleset_source` | Defining level (`Repository`, `Organization`, `Enterprise`) and source. |
+| `ruleset_target`, `ruleset_enforcement` | Target and enforcement state. Configured bypass entries in disabled/evaluate rulesets are not proof of currently enforced bypass privileges. |
+| `ruleset_conditions` | Complete JSON conditions determining where the ruleset applies. |
+| `ruleset_rules` | Complete JSON rule definitions and parameters. Bypass actors apply to the ruleset, not individually enumerated rules. |
+| `ruleset_bypass_actors` | Full JSON bypass list, repeated across that ruleset's actor rows. |
+| `ruleset_current_user_can_bypass` | Repository-specific bypass status of the authenticated caller, when returned; not the status of the actor in the row. |
+| `ruleset_created_at`, `ruleset_updated_at`, `ruleset__links` | Timestamps and API/HTML links, when returned. |
+| Other `ruleset_*` columns | Every additional field returned by the summary or detail endpoint, preserving nested values as JSON. Detail values take precedence. |
+
+Actor types currently include `User`, `Team`, `Integration`, `RepositoryRole`,
+`OrganizationAdmin`, and `DeployKey`. Organization administrators and deploy-key
+categories may have a null actor ID. Actors are exported **as configured**, by
+type and ID: the script does not expand teams, roles, administrators, apps, or
+deploy keys into users, or resolve their display names. An `Integration` actor
+ID identifies the app, not an individual user.
+
+`pull_request` restricts bypass to pull requests; `exempt` means rules are not
+run for that actor and a bypass audit entry is not created. Preserve these modes
+when interpreting eligibility. This is not a report of actual bypass activity
+or an exhaustive effective-permissions calculation: conditions, enforcement,
+other applicable rulesets and non-ruleset protections still matter.
+
+### API efficiency and rate limits
+
+The script uses the shared authenticated client and rate-limit policy documented
+above. Repository and ruleset lists request 100 entries per page, with stable
+repository name ordering. It fetches one detail per distinct repository/ruleset
+pair because summaries do not provide the full configuration and bypass list.
+Duplicate repositories and rulesets encountered during pagination are skipped.
+It does not perform actor-name lookups or member-expansion requests, and does
+not make a separate organization-ruleset inventory pass.
+
+An inherited ruleset's detail is deliberately retrieved in each repository's
+context, rather than blindly reusing another repository's response:
+`current_user_can_bypass` and bypass-list visibility are contextual. Requests
+are sequential to avoid concurrent bursts and secondary rate-limit pressure.
+Retries resume the same request; output is written only after all requests and
+permission checks succeed.
+
 ## Tests
 
 ```sh
@@ -155,6 +278,7 @@ python3 -m unittest -v
 ```
 
 Tests use fabricated values and mock authentication/network calls. They cover
-pagination, rate-limit retries and exhaustion, filters, all-field CSV output,
-empty results, failures, authentication, and the required organization CLI
-options. No real organization queries are needed.
+both scripts, repository/ruleset pagination, rate-limit retries and exhaustion,
+all-field CSV output, bypass actor types and modes, hidden actor permissions,
+empty results, failures, authentication, and CLI options. No real organization
+queries are needed.

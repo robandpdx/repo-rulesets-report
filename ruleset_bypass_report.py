@@ -171,7 +171,7 @@ def fetch_page(opener, request, page):
             hints = {
                 401: "Check that your token is valid.",
                 403: "Check organization access, token permissions and SSO authorization.",
-                404: "Check the organization login and your access to its rule suites.",
+                404: "Check the requested resource and your access to it.",
             }
             hint = hints.get(exc.code, "Check GitHub API availability and retry.")
             raise ReportError(f"HTTP {exc.code} on page {page}. {hint}") from None
@@ -183,46 +183,71 @@ def fetch_page(opener, request, page):
             raise ReportError(f"Invalid JSON response on page {page}.") from None
 
 
-def fetch_suites(org, token, time_period="month", evaluate_status="active"):
-    opener = build_opener(NoRedirects())
-    suites = []
-    page = 1
-    while True:
-        query = urlencode({
-            "rule_suite_result": "bypass",
-            "time_period": time_period,
-            "evaluate_status": evaluate_status,
-            "per_page": 100,
-            "page": page,
-        })
+class GitHubClient:
+    """Shared authenticated JSON requests, pagination and rate-limit handling."""
+
+    def __init__(self, token):
+        self.token = token
+        self.opener = build_opener(NoRedirects())
+
+    def request(self, path, params=None, page=1):
+        query = urlencode(params or {})
         request = Request(
-            f"{API_ROOT}/orgs/{org}/rulesets/rule-suites?{query}",
+            f"{API_ROOT}{path}" + (f"?{query}" if query else ""),
             headers={
                 "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {self.token}",
                 "X-GitHub-Api-Version": API_VERSION,
                 "User-Agent": "ruleset-bypass-report",
             },
         )
-        payload, link = fetch_page(opener, request, page)
-        if not isinstance(payload, list) or any(
-            not isinstance(item, dict) for item in payload
-        ):
-            raise ReportError(
-                f"Invalid response on page {page}: expected an array of objects."
+        try:
+            return fetch_page(self.opener, request, page)
+        except ReportError as exc:
+            raise ReportError(f"{path}: {exc}") from None
+
+    def get(self, path, params=None):
+        payload, _ = self.request(path, params)
+        if not isinstance(payload, dict):
+            raise ReportError(f"{path}: invalid response; expected an object.")
+        return payload
+
+    def paginate(self, path, params=None):
+        page = 1
+        while True:
+            query = dict(params or {}, per_page=100, page=page)
+            payload, link = self.request(path, query, page)
+            if not isinstance(payload, list) or any(
+                not isinstance(item, dict) for item in payload
+            ):
+                raise ReportError(
+                    f"{path}: invalid response on page {page}: "
+                    "expected an array of objects."
+                )
+            if len(payload) > 100:
+                raise ReportError(f"{path}: Invalid response on page {page}: exceeds page size.")
+            has_next = any(
+                re.search(r';\s*rel=["\']next["\']', part)
+                for part in link.split(",")
             )
-        if len(payload) > 100:
-            raise ReportError(f"Invalid response on page {page}: exceeds page size.")
-        has_next = any(
-            re.search(r';\s*rel=["\']next["\']', part)
-            for part in link.split(",")
-        )
-        if not payload and has_next:
-            raise ReportError(f"Invalid pagination on page {page}: empty next page.")
-        suites.extend(payload)
-        if len(payload) < 100 and not has_next:
-            return suites
-        page += 1
+            if not payload and has_next:
+                raise ReportError(f"{path}: Invalid pagination on page {page}: empty next page.")
+            yield from payload
+            if len(payload) < 100 and not has_next:
+                return
+            page += 1
+
+
+def fetch_suites(org, token, time_period="month", evaluate_status="active"):
+    client = GitHubClient(token)
+    return list(client.paginate(
+        f"/orgs/{org}/rulesets/rule-suites",
+        {
+            "rule_suite_result": "bypass",
+            "time_period": time_period,
+            "evaluate_status": evaluate_status,
+        },
+    ))
 
 
 def csv_value(value):
@@ -233,9 +258,9 @@ def csv_value(value):
     return value
 
 
-def write_csv(output, suites):
-    extra_columns = sorted({key for suite in suites for key in suite} - set(COLUMNS))
-    columns = list(COLUMNS) + extra_columns
+def write_csv(output, suites, columns=COLUMNS):
+    extra_columns = sorted({key for suite in suites for key in suite} - set(columns))
+    columns = list(columns) + extra_columns
     output = Path(output)
     temporary = None
     try:
