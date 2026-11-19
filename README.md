@@ -248,6 +248,14 @@ for access to organization-owned rulesets. A token must also have access to ever
 repository you intend to cover; a selected-repository token cannot inventory
 repositories outside its selection.
 
+Actor-name lookups use additional read endpoints when needed. Team visibility
+requires appropriate organization membership/access; listing installed apps
+requires organization-owner access; reading custom repository roles requires
+organization or repository administration access. App names are resolved through
+the organization's installation list and the app's public metadata. Do not
+broaden token permissions just for optional names: failed lookups print warnings
+to stderr and leave `bypass_actor_name` empty, without dropping actor rows.
+
 If GitHub hides a bypass list, the script fails explicitly rather than treating
 it as an empty list. API errors, malformed responses, hidden actor lists, or
 failed writes exit `1` without creating/replacing the final report. Invalid CLI
@@ -274,6 +282,7 @@ appears under each repository for which GitHub returns it.
 | `record_type` | `ruleset` or `repository_without_rulesets`. |
 | `bypass_actors_status` | `configured`, `none` (explicit empty array), or `not_applicable` (no rulesets). Hidden actor lists are errors, never `none`. |
 | `bypass_actor_type`, `bypass_actor_id` | Configured actor kind and GitHub ID. IDs are scoped by actor type, not necessarily user IDs. |
+| `bypass_actor_name` | Actor name supplied by GitHub or resolved through additional API requests: team/app/custom-role name, user login, or a predefined role/category label. Empty when unavailable. Appears between `bypass_actor_id` and `bypass_mode`. |
 | `bypass_mode` | `always`, `pull_request`, or `exempt`, as returned by GitHub. |
 | `bypass_actor_json` | Complete actor object, including any additional fields. |
 | `ruleset_id`, `ruleset_name`, `ruleset_node_id` | Ruleset identity. |
@@ -290,8 +299,10 @@ Actor types currently include `User`, `Team`, `Integration`, `RepositoryRole`,
 `OrganizationAdmin`, and `DeployKey`. Organization administrators and deploy-key
 categories may have a null actor ID. Actors are exported **as configured**, by
 type and ID: the script does not expand teams, roles, administrators, apps, or
-deploy keys into users, or resolve their display names. An `Integration` actor
-ID identifies the app, not an individual user.
+deploy keys into users. Names are best-effort annotations; IDs and original
+actor JSON are retained unchanged. Organization administrator, enterprise owner,
+and deploy-key entries are category labels, not individual account/key names.
+An `Integration` actor ID identifies the app, not an individual user.
 
 `pull_request` restricts bypass to pull requests; `exempt` means rules are not
 run for that actor and a bypass audit entry is not created. Preserve these modes
@@ -306,15 +317,21 @@ above. Repository and ruleset lists request 100 entries per page, with stable
 repository name ordering. It fetches one detail per distinct repository/ruleset
 pair because summaries do not provide the full configuration and bypass list.
 Duplicate repositories and rulesets encountered during pagination are skipped.
-It does not perform actor-name lookups or member-expansion requests, and does
-not make a separate organization-ruleset inventory pass.
+Actor names are resolved after collecting the configuration. Team and app
+installation directories are paginated and loaded at most once when needed.
+User, app-metadata, and custom-role lookups are cached per actor type and ID
+across repositories, including failed lookups. Names already present in an
+actor object require no lookup. Name requests use the same rate-limit policy,
+but lookup failures only warn and leave the name empty.
+The script does not perform member-expansion requests or make a separate
+organization-ruleset inventory pass.
 
 An inherited ruleset's detail is deliberately retrieved in each repository's
 context, rather than blindly reusing another repository's response:
 `current_user_can_bypass` and bypass-list visibility are contextual. Requests
 are sequential to avoid concurrent bursts and secondary rate-limit pressure.
 Retries resume the same request; output is written only after all requests and
-permission checks succeed.
+required configuration permission checks succeed.
 
 ## Tests
 

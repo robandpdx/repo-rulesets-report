@@ -55,8 +55,20 @@ class CollectionTests(unittest.TestCase):
         client = self.client(
             [detail], [{"id": 10, "future_summary": "retained"}]
         )
+        client.paginate.side_effect = [
+            [repository()], [{"id": 10, "future_summary": "retained"}],
+            [{"id": 11, "name": "Release team"}],
+            [{"app_id": 12, "app_slug": "release-app"}],
+        ]
+        client.get.side_effect = [
+            detail, {"name": "Release app"}, {"login": "release-user"},
+        ]
         rows = report.collect_rulesets(client, "example")
         self.assertEqual(len(rows), len(actors))
+        self.assertEqual([row["bypass_actor_name"] for row in rows], [
+            "Release team", "Release app", "Admin",
+            "Organization administrators", "Deploy keys", "release-user",
+        ])
         for actor, row in zip(actors, rows):
             self.assertEqual(row["bypass_actor_type"], actor["actor_type"])
             self.assertEqual(row["bypass_actor_id"], actor["actor_id"])
@@ -69,7 +81,7 @@ class CollectionTests(unittest.TestCase):
         client.paginate.assert_any_call(
             "/repos/example/one/rulesets", {"includes_parents": "true"}
         )
-        client.get.assert_called_once_with(
+        client.get.assert_any_call(
             "/repos/example/one/rulesets/10", {"includes_parents": "true"}
         )
 
@@ -172,6 +184,52 @@ class CollectionTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    @patch.object(shared, "build_opener")
+    def test_paginated_actor_directories_and_cached_names(self, build):
+        actors = [
+            {"actor_type": "Team", "actor_id": 11},
+            {"actor_type": "Integration", "actor_id": 11},
+            {"actor_type": "RepositoryRole", "actor_id": 99},
+        ]
+        detail = ruleset(bypass_actors=actors)
+        build.return_value.open.side_effect = [
+            response([repository(), repository(2, "two")]),
+            response([{"id": 10}]), response(detail),
+            response([{"id": 10}]), response(detail),
+            response([{"id": 1, "name": "Other team"}],
+                     '<https://api.github.com/orgs/example/teams?page=2>; rel="next"'),
+            response([{"id": 11, "name": "Release team"}]),
+            response({"installations": [{"app_id": 1, "app_slug": "other"}]},
+                     '<https://api.github.com/orgs/example/installations?page=2>; rel="next"'),
+            response({"installations": [{"app_id": 11, "app_slug": "release-app"}]}),
+            response({"id": 11, "name": "Release app"}),
+            response({"id": 99, "name": "Release manager"}),
+        ]
+        rows = report.collect_rulesets(shared.GitHubClient("fake-token"), "example")
+        self.assertEqual([row["bypass_actor_name"] for row in rows], [
+            "Release team", "Release app", "Release manager",
+            "Release team", "Release app", "Release manager",
+        ])
+        calls = build.return_value.open.call_args_list
+        self.assertEqual(len(calls), 11)
+        for index in (6, 8):
+            query = parse_qs(urlsplit(calls[index].args[0].full_url).query)
+            self.assertEqual(query["page"], ["2"])
+            self.assertEqual(query["per_page"], ["100"])
+        self.assertEqual(urlsplit(calls[9].args[0].full_url).path, "/apps/release-app")
+        self.assertEqual(urlsplit(calls[10].args[0].full_url).path,
+                         "/orgs/example/custom-repository-roles/99")
+
+    @patch.object(shared, "build_opener")
+    def test_invalid_installation_envelopes_fail_explicitly(self, build):
+        for payload in ([], {}, {"installations": {}}, {"installations": [1]}):
+            with self.subTest(payload=payload):
+                build.return_value.open.return_value = response(payload)
+                with self.assertRaisesRegex(shared.ReportError, "invalid response"):
+                    list(shared.GitHubClient("fake-token").paginate(
+                        "/orgs/example/installations", items_key="installations"
+                    ))
+
     @patch.object(shared.time, "sleep")
     @patch.object(shared, "build_opener")
     def test_paginated_repositories_rulesets_and_rate_limited_detail(self, build, sleep):
@@ -188,6 +246,7 @@ class IntegrationTests(unittest.TestCase):
             response(detail_two),
             response([repository(2, "two")]),
             response([]),
+            response({"id": 21, "login": "release-user", "name": "Release User"}),
         ]
         with patch("sys.stderr", new=io.StringIO()):
             rows = report.collect_rulesets(shared.GitHubClient("fake-token"), "example")
@@ -195,7 +254,9 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([row["record_type"] for row in rows],
                          ["ruleset", "ruleset", "repository_without_rulesets"])
         calls = build.return_value.open.call_args_list
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 9)
+        self.assertEqual(rows[0]["bypass_actor_name"], "release-user")
+        self.assertEqual(urlsplit(calls[8].args[0].full_url).path, "/user/21")
         self.assertEqual(calls[4].args[0].full_url, calls[5].args[0].full_url)
         sleep.assert_called_once_with(1)
         for call in calls:
@@ -224,6 +285,7 @@ class CsvAndCliTests(unittest.TestCase):
         client = Mock()
         client.paginate.side_effect = [[repository()], [{"id": 10}]]
         actor = {"actor_type": "Team", "actor_id": 11,
+                 "name": 'Release, "team"',
                  "bypass_mode": "always", "extra": ["new"]}
         client.get.return_value = ruleset(
             name='Protection, "main"', bypass_actors=[actor],
@@ -235,11 +297,42 @@ class CsvAndCliTests(unittest.TestCase):
             reader = csv.DictReader(handle)
             row, = list(reader)
             self.assertIn("ruleset_extra", reader.fieldnames)
+            index = reader.fieldnames.index("bypass_actor_id")
+            self.assertEqual(reader.fieldnames[index:index + 3], [
+                "bypass_actor_id", "bypass_actor_name", "bypass_mode",
+            ])
+        self.assertEqual(row["bypass_actor_name"], 'Release, "team"')
         self.assertEqual(json.loads(row["bypass_actor_json"]), actor)
         self.assertEqual(json.loads(row["ruleset_extra"]), {"include": ["\u00e9\nbranch"]})
         self.assertEqual(json.loads(row["ruleset_bypass_actors"]), [actor])
         self.assertEqual(row["ruleset_name"], 'Protection, "main"')
         self.assertEqual(row["repository_private"], "true")
+
+    @patch.object(report, "get_token", return_value="fake-token")
+    @patch.object(shared, "build_opener")
+    def test_unavailable_actor_names_warn_and_still_write_report(self, build, token):
+        for status in (403, 404):
+            with self.subTest(status=status):
+                actor = {"actor_type": "User", "actor_id": 21, "bypass_mode": "always"}
+                build.return_value.open.side_effect = [
+                    response([repository()]), response([{"id": 10}]),
+                    response(ruleset(bypass_actors=[actor, actor])),
+                    http_error(status),
+                ]
+                with patch("sys.stderr", new=io.StringIO()) as stderr, \
+                        patch("sys.stdout", new=io.StringIO()):
+                    self.assertEqual(report.main([
+                        "-o", "example", "--output", str(self.output),
+                    ]), 0)
+                self.assertIn(f"HTTP {status}", stderr.getvalue())
+                self.assertEqual(stderr.getvalue().count("Warning:"), 1)
+                with self.output.open(encoding="utf-8", newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual(len(rows), 2)
+                for row in rows:
+                    self.assertEqual(row["bypass_actor_name"], "")
+                    self.assertEqual(row["bypass_actor_id"], "21")
+                    self.assertEqual(json.loads(row["bypass_actor_json"]), actor)
 
     @patch.object(report, "get_token", return_value="fake-token")
     @patch.object(report, "GitHubClient")
@@ -302,6 +395,35 @@ class CsvAndCliTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     report.main(args)
                 self.assertEqual(caught.exception.code, 2)
+
+
+class ActorNameTests(unittest.TestCase):
+    def test_failed_directory_is_not_retried_and_missing_names_warn(self):
+        client = Mock()
+        client.paginate.side_effect = shared.ReportError("HTTP 403: access denied")
+        names = report.ActorNames(client, "example")
+        with patch("sys.stderr", new=io.StringIO()) as stderr:
+            for actor_id in (11, 12, 11):
+                self.assertIsNone(names.resolve({
+                    "actor_type": "Team", "actor_id": actor_id,
+                }))
+            self.assertIsNone(names.resolve({
+                "actor_type": "FutureActor", "actor_id": {"future": True},
+            }))
+        self.assertIn("HTTP 403", stderr.getvalue())
+        self.assertIn("FutureActor", stderr.getvalue())
+        client.paginate.assert_called_once_with("/orgs/example/teams")
+        client.get.assert_not_called()
+
+    def test_embedded_name_avoids_lookup_and_is_preserved(self):
+        client = Mock()
+        names = report.ActorNames(client, "example")
+        self.assertEqual(names.resolve({
+            "actor_type": "Integration", "actor_id": 12,
+            "actor_name": "Provided app",
+        }), "Provided app")
+        client.get.assert_not_called()
+        client.paginate.assert_not_called()
 
 
 if __name__ == "__main__":

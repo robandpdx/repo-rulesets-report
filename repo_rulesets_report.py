@@ -29,6 +29,7 @@ COLUMNS = (
     "bypass_actors_status",
     "bypass_actor_type",
     "bypass_actor_id",
+    "bypass_actor_name",
     "bypass_mode",
     "bypass_actor_json",
     "ruleset_id",
@@ -58,6 +59,84 @@ def require_text(value, context):
     if not isinstance(value, str) or not value:
         raise ReportError(f"{context}: expected a nonempty string.")
     return value
+
+
+class ActorNames:
+    """Resolve optional actor names once per actor or organization directory."""
+
+    def __init__(self, client, org):
+        self.client = client
+        self.org_path = f"/orgs/{quote(org, safe='')}"
+        self.names = {}
+        self.directories = {}
+
+    def directory(self, actor_type):
+        if actor_type not in self.directories:
+            # A failed directory lookup must not be retried for every actor.
+            self.directories[actor_type] = {}
+            if actor_type == "Team":
+                items = self.client.paginate(f"{self.org_path}/teams")
+                id_field = "id"
+            else:
+                items = self.client.paginate(
+                    f"{self.org_path}/installations", items_key="installations"
+                )
+                id_field = "app_id"
+            directory = {}
+            for item in items:
+                actor_id = require_id(item.get(id_field), f"{actor_type} lookup")
+                directory[actor_id] = item
+            self.directories[actor_type] = directory
+        return self.directories[actor_type]
+
+    def lookup(self, actor_type, actor_id):
+        if actor_type == "User":
+            user = self.client.get(f"/user/{actor_id}")
+            return user.get("login") or user.get("name")
+        if actor_type in ("Team", "Integration"):
+            item = self.directory(actor_type).get(actor_id)
+            if item is None:
+                raise ReportError("Actor was not returned by the organization lookup.")
+            if actor_type == "Team":
+                return item.get("name")
+            slug = require_text(item.get("app_slug"), "App lookup: app_slug")
+            app = self.client.get(f"/apps/{quote(slug, safe='')}")
+            return app.get("name")
+        if actor_type == "RepositoryRole":
+            # These predefined bypass role IDs apply to GitHub.com.
+            predefined = {2: "Maintain", 4: "Write", 5: "Admin"}
+            if actor_id in predefined:
+                return predefined[actor_id]
+            role = self.client.get(
+                f"{self.org_path}/custom-repository-roles/{actor_id}"
+            )
+            return role.get("name")
+        return {
+            "OrganizationAdmin": "Organization administrators",
+            "EnterpriseOwner": "Enterprise owners",
+            "DeployKey": "Deploy keys",
+        }.get(actor_type)
+
+    def resolve(self, actor):
+        supplied = actor.get("actor_name") or actor.get("name") or actor.get("login")
+        if isinstance(supplied, str) and supplied:
+            return supplied
+        actor_type, actor_id = actor["actor_type"], actor.get("actor_id")
+        key = (actor_type, actor_id if type(actor_id) is int else None)
+        if key not in self.names:
+            try:
+                name = require_text(
+                    self.lookup(actor_type, actor_id), "Actor lookup: name"
+                )
+            except ReportError as exc:
+                print(
+                    f"Warning: could not resolve bypass actor name for "
+                    f"{actor_type} {actor_id}: {exc} Leaving bypass_actor_name empty.",
+                    file=sys.stderr,
+                )
+                name = None
+            self.names[key] = name
+        return self.names[key]
 
 
 def ruleset_rows(repository, ruleset, context):
@@ -150,6 +229,10 @@ def collect_rulesets(client, org, repository_only=False):
                 "record_type": "repository_without_rulesets",
                 "bypass_actors_status": "not_applicable",
             })
+    names = ActorNames(client, org)
+    for row in rows:
+        if row["bypass_actors_status"] == "configured":
+            row["bypass_actor_name"] = names.resolve(row["bypass_actor_json"])
     return rows
 
 

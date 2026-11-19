@@ -212,11 +212,18 @@ class GitHubClient:
             raise ReportError(f"{path}: invalid response; expected an object.")
         return payload
 
-    def paginate(self, path, params=None):
+    def paginate(self, path, params=None, *, items_key=None):
         page = 1
         while True:
             query = dict(params or {}, per_page=100, page=page)
             payload, link = self.request(path, query, page)
+            if items_key is not None:
+                if not isinstance(payload, dict) or items_key not in payload:
+                    raise ReportError(
+                        f"{path}: invalid response on page {page}: "
+                        f"expected an object containing {items_key}."
+                    )
+                payload = payload[items_key]
             if not isinstance(payload, list) or any(
                 not isinstance(item, dict) for item in payload
             ):
